@@ -13,7 +13,7 @@ Arguments:
 Options:
   -h --help                    Show this screen.
   --max-tweets-count <type>    Maximum number of tweets to fetch before stopping. [default: 2500].
-  --nodes-to-consider <type>   Nodes to consider in the graph: friends, followers or all. [default: followers].
+  --nodes-to-consider <type>   Nodes to consider in the graph: friends, followers or all. [default: all].
   --edges-ratio <ratio>        Ratio of edges to export in the graph (chosen randomly among non-mutuals). [default: 1].
   --credentials <file>         Path of the credentials for Twitter API [default: credentials.json].
   --excluded <file>            Path of the list of excluded users [default: excluded.json].
@@ -21,9 +21,11 @@ Options:
   --run-http-server            Run an HTTP server to visualize the graph in your browser with d3.js.
   --save_frequency <freq>      Number of account between each save in cache. [default: 15].
   --filtering <type>           Filter to include only a subset of information for each account: full, light, min [default: full].
-  --auth <type>                Authentication method: oauth1, oauth2-bearer or oauth2-consumer-key [default: oauth1].
+  --auth <type>                Authentication method: oauth1, oauth2-bearer or oauth2-consumer-key [default: oauth2-bearer].
 """
 from functools import partial
+from pydoc import cli
+from re import A
 from time import sleep
 import requests
 import tweepy
@@ -106,6 +108,7 @@ def fetch_users(apis, target, mode, nodes_to_consider, max_tweets_count, out_pat
     followers_ids = [user["id"] for user in followers]
     mutuals = [user["id"] for user in friends if user["id"] in followers_ids]
     all_users = followers + [user for user in friends if user["id"] not in followers_ids]
+        
     return followers, friends, mutuals, all_users
 
 
@@ -264,7 +267,27 @@ def get_or_set(path, value=None, force=False, api_function=False):
     return value
 
 
-def save_to_graph(users, friendships, out_path, filtering, edges_ratio=1.0):
+def save_to_graph(users, friendships, tweets, out_path, filtering, edges_ratio=1.0):
+    columns = ["id", "author_id", "text", "retweet_count", "like_count", "quote_count", "created_at", "lang", "is_retweet"]
+    ## Save to graph scratch version. 
+    nodes = {tweet.id: [
+        tweet.author_id,
+        tweet.text, 
+        tweet.public_metrics['retweet_count'], 
+        tweet.public_metrics['like_count'],
+        tweet.public_metrics['like_count'],
+        tweet.public_metrics['quote_count'], 
+        str(tweet.created_at),
+        tweet.lang,
+        "RT" in tweet.text] for tweet in tweets}
+
+    print("Total {} tweets retrieved for all users, tweets={}".format(len(nodes), len(tweets)))
+    tweets_df = pd.DataFrame.from_dict(nodes, orient='index', columns=columns)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    tweets_path = out_path / "tweets.csv"
+    tweets_df.to_csv(tweets_path, index_label="id")
+    print("Successfully exported {} nodes to {}.".format(tweets_df.shape[0], tweets_df))
+
     columns = [field for field in users[0] if field not in ["id", "id_str"]]
     nodes = {user["id_str"]: [user.get(field, "") for field in columns] for user in users}
     users_df = pd.DataFrame.from_dict(nodes, orient='index', columns=columns)
@@ -325,14 +348,17 @@ def main():
                                                                  out_path)
             users = {"followers": followers, "friends": friends, "all": all_users,
                      "few": random.choices(followers, k=min(100, len(followers)))}[options["--nodes-to-consider"]]
+        
             friendships = {}
             try:
+                tweets = get_tweets(all_users, out_path)
+                print("{} tweets extracted for all the followers of the user {}".format(len(tweets), target))
                 fetch_friendships(friendships, apis, users, Path(options["--excluded"]), Path(options["--out"]), target,
                                   save_frequency=int(options["--save_frequency"]),
                                   friends_restricted_to=all_users)
             except KeyboardInterrupt:
                 print('KeyboardInterrupt. Exporting the graph...')
-            save_to_graph(users, friendships, out_path, filtering=options["--filtering"],
+            save_to_graph(users, friendships, tweets, out_path, filtering=options["--filtering"],
                           edges_ratio=float(options["--edges-ratio"]))
             if options["--run-http-server"]:
                 serve_http(out_path)
@@ -340,6 +366,37 @@ def main():
         print(e)  # Why do I get these?
         main()  # Retry!
 
+def get_tweets(users, out_path):
+    ## Buidling twitter v2 clients
+    options = docopt(__doc__)
+    credentials = json.loads(open(options["--credentials"]).read())
+    clients = [tweepy.Client(bearer_token=credential["bearer_token"]) for credential in credentials]
 
+    ## API Options 
+    tweet_fields = ['attachments','author_id','context_annotations','conversation_id','created_at','entities','geo','id','in_reply_to_user_id','lang','public_metrics','referenced_tweets','reply_settings','source','text']
+    user_fields = ['created_at','description','entities','id','location','name','pinned_tweet_id','profile_image_url','protected','public_metrics','url','username','verified','withheld']
+
+    all_tweets = []
+    api_idx = 0
+    for user in users:
+        try:
+            tweets = clients[api_idx].get_users_tweets(id=user["id"], max_results=100, tweet_fields=tweet_fields, user_fields=user_fields)
+            print("{} Tweets returned for user: {}".format(len(tweets.data), user["id"]))
+            all_tweets = all_tweets + tweets.data
+        except tweepy.TooManyRequests as e:
+            api_idx = (api_idx + 1) % len(clients)
+            print(f"You reached the rate limit. Moving to next api: #{api_idx}")
+            sleep(15)
+        except tweepy.TweepyException as e:
+            print(f"failed at api: #{api_idx}")
+            print("...but it failed. Error: {}".format(e))
+            break
+        except (requests.exceptions.ConnectionError, requests.exceptions.ReadTimeout) as e:
+            print(e)  # Just in case I would get these as well just like elurent. 
+            sleep(5)
+
+    return all_tweets
+
+    
 if __name__ == "__main__":
     main()
